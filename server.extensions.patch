@@ -1,0 +1,502 @@
+--- a/server.py (upstream: 1rgs/claude-code-proxy)	2026-05-15 18:02:02
++++ b/server.py (with DobbyAI extensions)	2026-05-15 17:56:47
+@@ -5,6 +5,7 @@
+ from pydantic import BaseModel, Field, field_validator
+ from typing import List, Dict, Any, Optional, Union, Literal
+ import httpx
++from auth_middleware import DobbyAuthMiddleware
+ import os
+ from fastapi.responses import JSONResponse, StreamingResponse
+ import litellm
+@@ -77,7 +78,10 @@
+ 
+ app = FastAPI()
+ 
+-# Get API keys from environment
++if os.environ.get("ENABLE_DOBBY_AUTH") == "true":
++    app.add_middleware(DobbyAuthMiddleware)
++    logger.warning("DobbyAuthMiddleware enabled for authentication")
++    
+ ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")
+ OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
+ GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
+@@ -92,6 +96,12 @@
+ # Get OpenAI base URL from environment (if set)
+ OPENAI_BASE_URL = os.environ.get("OPENAI_BASE_URL")
+ 
++# Vision model routing — two-stage VL→Coder pipeline
++# When images are detected, proxy first asks the VL model to describe them,
++# then passes the text description to the coding model
++VISION_MODEL_BASE = os.environ.get("VISION_MODEL_BASE")  # e.g. http://your-vision-host:8005/v1
++VISION_MODEL = os.environ.get("VISION_MODEL")  # e.g. unsloth/Qwen3-VL-8B-Instruct-unsloth-bnb-4bit
++
+ # Get preferred provider (default to openai)
+ PREFERRED_PROVIDER = os.environ.get("PREFERRED_PROVIDER", "openai").lower()
+ 
+@@ -144,7 +154,110 @@
+         # Recursively clean items in a list
+         return [clean_gemini_schema(item) for item in schema]
+     return schema
++
++async def describe_image_with_vl(image_source: Dict[str, Any]) -> str:
++    """Send an image to the VL model and get a text description.
++    Used in the two-stage VL→Coder pipeline: VL describes, Coder codes."""
++    if not VISION_MODEL_BASE or not VISION_MODEL:
++        return "[Image: vision model not configured — set VISION_MODEL_BASE and VISION_MODEL]"
++
++    # Build OpenAI vision message with the image
++    image_content = {
++        "type": "image_url",
++        "image_url": {}
++    }
++    # Anthropic sends base64 as {type: "base64", media_type: "image/png", data: "..."}
++    if image_source.get("type") == "base64":
++        media_type = image_source.get("media_type", "image/png")
++        data = image_source.get("data", "")
++        image_content["image_url"]["url"] = f"data:{media_type};base64,{data}"
++    elif image_source.get("type") == "url":
++        image_content["image_url"]["url"] = image_source.get("url", "")
++    else:
++        return f"[Image: unsupported source type {image_source.get('type')}]"
++
++    try:
++        async with httpx.AsyncClient(timeout=120.0) as client:
++            resp = await client.post(
++                f"{VISION_MODEL_BASE}/chat/completions",
++                json={
++                    "model": VISION_MODEL,
++                    "messages": [
++                        {
++                            "role": "user",
++                            "content": [
++                                {"type": "text", "text": "Describe this image in detail. Include all text, UI elements, layout, and any code or terminal output visible."},
++                                image_content
++                            ]
++                        }
++                    ],
++                    "max_tokens": 1024,
++                    "temperature": 0.1
++                }
++            )
++            resp.raise_for_status()
++            result = resp.json()
++            description = result["choices"][0]["message"]["content"]
++            logger.warning(f"🖼️ VL described image ({len(description)} chars)")
++            return f"[Image description from Qwen3-VL:\n{description}\n]"
++    except Exception as e:
++        logger.error(f"VL image description failed: {e}")
++        return f"[Image: VL model error — {str(e)[:200]}]"
++
++
++async def _process_image_block(block) -> str:
++    """Extract image source from a block and get VL description."""
++    source = block.source if hasattr(block, 'source') else {}
++    if isinstance(source, dict):
++        return await describe_image_with_vl(source)
++    else:
++        return await describe_image_with_vl(dict(source) if hasattr(source, '__iter__') else {})
++
++
++async def replace_images_with_descriptions(messages: list) -> list:
++    """Scan Anthropic messages for image blocks, replace with VL descriptions.
++    Checks both top-level content AND nested tool_result content blocks.
++    This enables the text-only Coder model to understand image content."""
++    if not VISION_MODEL_BASE:
++        return messages
++
++    import copy
++    messages = copy.deepcopy(messages)
++
++    for msg in messages:
++        if not hasattr(msg, 'content') or isinstance(msg.content, str):
++            continue
++        new_content = []
++        for block in msg.content:
++            if hasattr(block, 'type') and block.type == "image":
++                # Top-level image block (direct user message with image)
++                description = await _process_image_block(block)
++                text_block = type('TextBlock', (), {'type': 'text', 'text': description})()
++                new_content.append(text_block)
++            elif hasattr(block, 'type') and block.type == "tool_result":
++                # Tool result may contain nested image blocks (e.g. Read tool returning an image)
++                if hasattr(block, 'content') and isinstance(block.content, list):
++                    new_sub = []
++                    for sub in block.content:
++                        if hasattr(sub, 'type') and sub.type == "image":
++                            description = await _process_image_block(sub)
++                            text_sub = type('TextBlock', (), {'type': 'text', 'text': description})()
++                            new_sub.append(text_sub)
++                        elif isinstance(sub, dict) and sub.get('type') == 'image':
++                            source = sub.get('source', {})
++                            description = await describe_image_with_vl(source)
++                            new_sub.append({'type': 'text', 'text': description})
++                        else:
++                            new_sub.append(sub)
++                    block.content = new_sub
++                new_content.append(block)
++            else:
++                new_content.append(block)
++        msg.content = new_content
++
++    return messages
+ 
++
+ # Models for Anthropic API requests
+ class ContentBlockText(BaseModel):
+     type: Literal["text"]
+@@ -421,12 +534,18 @@
+     
+     messages = []
+     
++    # Inject tool-call format hint for local models (Qwen uses <tools> tags)
++    TOOL_HINT = "\n\nWhen you need to use a tool, output the tool call inside <tools></tools> XML tags as a JSON object with 'name' and 'arguments' keys."
++
+     # Add system message if present
+     if anthropic_request.system:
+         # Handle different formats of system messages
+         if isinstance(anthropic_request.system, str):
+-            # Simple string format
+-            messages.append({"role": "system", "content": anthropic_request.system})
++            # Simple string format — append tool hint if tools are present
++            sys_content = anthropic_request.system
++            if hasattr(anthropic_request, 'tools') and anthropic_request.tools:
++                sys_content += TOOL_HINT
++            messages.append({"role": "system", "content": sys_content})
+         elif isinstance(anthropic_request.system, list):
+             # List of content blocks
+             system_text = ""
+@@ -437,8 +556,14 @@
+                     system_text += block.get("text", "") + "\n\n"
+             
+             if system_text:
++                if hasattr(anthropic_request, 'tools') and anthropic_request.tools:
++                    system_text += TOOL_HINT
+                 messages.append({"role": "system", "content": system_text.strip()})
+-    
++    else:
++        # No system message but tools present — add tool hint as system message
++        if hasattr(anthropic_request, 'tools') and anthropic_request.tools:
++            messages.append({"role": "system", "content": "You are a helpful assistant." + TOOL_HINT})
++
+     # Add conversation messages
+     for idx, msg in enumerate(anthropic_request.messages):
+         content = msg.content
+@@ -449,108 +574,103 @@
+             # OpenAI/LiteLLM format expects the assistant to call the tool, 
+             # and the user's next message to include the result as plain text
+             if msg.role == "user" and any(block.type == "tool_result" for block in content if hasattr(block, "type")):
+-                # For user messages with tool_result, split into separate messages
+-                text_content = ""
+-                
+-                # Extract all text parts and concatenate them
++                # Convert Anthropic tool_result blocks to OpenAI role:"tool" messages
++                # This is critical for multi-turn tool calling to work!
++                text_parts = []
++
+                 for block in content:
+                     if hasattr(block, "type"):
+                         if block.type == "text":
+-                            text_content += block.text + "\n"
++                            text_parts.append(block.text)
+                         elif block.type == "tool_result":
+-                            # Add tool result as a message by itself - simulate the normal flow
+                             tool_id = block.tool_use_id if hasattr(block, "tool_use_id") else ""
+-                            
+-                            # Handle different formats of tool result content
++
++                            # Extract result content
+                             result_content = ""
+                             if hasattr(block, "content"):
+                                 if isinstance(block.content, str):
+                                     result_content = block.content
+                                 elif isinstance(block.content, list):
+-                                    # If content is a list of blocks, extract text from each
+                                     for content_block in block.content:
+                                         if hasattr(content_block, "type") and content_block.type == "text":
+                                             result_content += content_block.text + "\n"
+                                         elif isinstance(content_block, dict) and content_block.get("type") == "text":
+                                             result_content += content_block.get("text", "") + "\n"
+                                         elif isinstance(content_block, dict):
+-                                            # Handle any dict by trying to extract text or convert to JSON
+-                                            if "text" in content_block:
+-                                                result_content += content_block.get("text", "") + "\n"
+-                                            else:
+-                                                try:
+-                                                    result_content += json.dumps(content_block) + "\n"
+-                                                except:
+-                                                    result_content += str(content_block) + "\n"
++                                            result_content += content_block.get("text", json.dumps(content_block)) + "\n"
+                                 elif isinstance(block.content, dict):
+-                                    # Handle dictionary content
+-                                    if block.content.get("type") == "text":
+-                                        result_content = block.content.get("text", "")
+-                                    else:
+-                                        try:
+-                                            result_content = json.dumps(block.content)
+-                                        except:
+-                                            result_content = str(block.content)
++                                    result_content = block.content.get("text", json.dumps(block.content))
+                                 else:
+-                                    # Handle any other type by converting to string
+-                                    try:
+-                                        result_content = str(block.content)
+-                                    except:
+-                                        result_content = "Unparseable content"
+-                            
+-                            # In OpenAI format, tool results come from the user (rather than being content blocks)
+-                            text_content += f"Tool result for {tool_id}:\n{result_content}\n"
+-                
+-                # Add as a single user message with all the content
+-                messages.append({"role": "user", "content": text_content.strip()})
++                                    result_content = str(block.content)
++
++                            # Send as proper OpenAI tool message — this is the key fix!
++                            messages.append({
++                                "role": "tool",
++                                "tool_call_id": tool_id,
++                                "content": result_content.strip()
++                            })
++
++                # Add any text parts as a separate user message
++                if text_parts:
++                    messages.append({"role": "user", "content": "\n".join(text_parts).strip()})
+             else:
+                 # Regular handling for other message types
+-                processed_content = []
++                # For assistant messages with tool_use, convert to OpenAI tool_calls format
++                text_parts = []
++                tool_calls = []
++
+                 for block in content:
+                     if hasattr(block, "type"):
+                         if block.type == "text":
+-                            processed_content.append({"type": "text", "text": block.text})
++                            text_parts.append(block.text)
+                         elif block.type == "image":
+-                            processed_content.append({"type": "image", "source": block.source})
++                            text_parts.append("[image]")
+                         elif block.type == "tool_use":
+-                            # Handle tool use blocks if needed
+-                            processed_content.append({
+-                                "type": "tool_use",
+-                                "id": block.id,
+-                                "name": block.name,
+-                                "input": block.input
++                            # Convert to OpenAI tool_calls format
++                            tool_input = block.input if hasattr(block, "input") else {}
++                            tool_calls.append({
++                                "id": block.id if hasattr(block, "id") else f"toolu_{uuid.uuid4().hex[:24]}",
++                                "type": "function",
++                                "function": {
++                                    "name": block.name if hasattr(block, "name") else "",
++                                    "arguments": json.dumps(tool_input) if isinstance(tool_input, dict) else str(tool_input)
++                                }
+                             })
+                         elif block.type == "tool_result":
+-                            # Handle different formats of tool result content
+-                            processed_content_block = {
+-                                "type": "tool_result",
+-                                "tool_use_id": block.tool_use_id if hasattr(block, "tool_use_id") else ""
+-                            }
+-                            
+-                            # Process the content field properly
++                            # tool_result in non-user message — shouldn't happen but handle gracefully
++                            result_content = ""
+                             if hasattr(block, "content"):
+                                 if isinstance(block.content, str):
+-                                    # If it's a simple string, create a text block for it
+-                                    processed_content_block["content"] = [{"type": "text", "text": block.content}]
+-                                elif isinstance(block.content, list):
+-                                    # If it's already a list of blocks, keep it
+-                                    processed_content_block["content"] = block.content
++                                    result_content = block.content
+                                 else:
+-                                    # Default fallback
+-                                    processed_content_block["content"] = [{"type": "text", "text": str(block.content)}]
+-                            else:
+-                                # Default empty content
+-                                processed_content_block["content"] = [{"type": "text", "text": ""}]
+-                                
+-                            processed_content.append(processed_content_block)
+-                
+-                messages.append({"role": msg.role, "content": processed_content})
++                                    result_content = str(block.content)
++                            messages.append({
++                                "role": "tool",
++                                "tool_call_id": block.tool_use_id if hasattr(block, "tool_use_id") else "",
++                                "content": result_content
++                            })
++                            continue
++
++                if msg.role == "assistant" and tool_calls:
++                    # Assistant message with tool calls — use OpenAI format
++                    msg_dict = {
++                        "role": "assistant",
++                        "content": "\n".join(text_parts) if text_parts else None,
++                        "tool_calls": tool_calls
++                    }
++                    messages.append(msg_dict)
++                else:
++                    # Regular message (user text, assistant text without tools)
++                    text = "\n".join(text_parts) if text_parts else ""
++                    messages.append({"role": msg.role, "content": text})
+     
+-    # Cap max_tokens for OpenAI models to their limit of 16384
++    # Cap max_tokens to fit within model's context window
++    # Local vLLM models have limited context — cap to safe value
++    MAX_LOCAL_TOKENS = 4096  # free-code system prompt is ~16K tokens, need room within 32K
+     max_tokens = anthropic_request.max_tokens
+     if anthropic_request.model.startswith("openai/") or anthropic_request.model.startswith("gemini/"):
+-        max_tokens = min(max_tokens, 16384)
+-        logger.debug(f"Capping max_tokens to 16384 for OpenAI/Gemini model (original value: {anthropic_request.max_tokens})")
++        max_tokens = min(max_tokens, MAX_LOCAL_TOKENS)
++        logger.debug(f"Capping max_tokens to {MAX_LOCAL_TOKENS} (original: {anthropic_request.max_tokens})")
+     
+     # Create LiteLLM request dict
+     litellm_request = {
+@@ -657,6 +777,11 @@
+             choices = litellm_response.choices
+             message = choices[0].message if choices and len(choices) > 0 else None
+             content_text = message.content if message and hasattr(message, 'content') else ""
++            # Handle Qwen's reasoning field — if content is empty but reasoning has text, use reasoning
++            reasoning_text = getattr(message, 'reasoning', None) or getattr(message, 'reasoning_content', None) if message else None
++            if (not content_text or content_text.strip() == "") and reasoning_text:
++                content_text = reasoning_text
++                logger.debug(f"Using reasoning field as content (Qwen thinking mode)")
+             tool_calls = message.tool_calls if message and hasattr(message, 'tool_calls') else None
+             finish_reason = choices[0].finish_reason if choices and len(choices) > 0 else "stop"
+             usage_info = litellm_response.usage
+@@ -682,6 +807,11 @@
+             choices = response_dict.get("choices", [{}])
+             message = choices[0].get("message", {}) if choices and len(choices) > 0 else {}
+             content_text = message.get("content", "")
++            # Handle Qwen's reasoning field — if content is empty but reasoning has text, use reasoning
++            reasoning_text = message.get("reasoning", None) or message.get("reasoning_content", None)
++            if (not content_text or content_text.strip() == "") and reasoning_text:
++                content_text = reasoning_text
++                logger.debug(f"Using reasoning field as content (Qwen thinking mode)")
+             tool_calls = message.get("tool_calls", None)
+             finish_reason = choices[0].get("finish_reason", "stop") if choices and len(choices) > 0 else "stop"
+             usage_info = response_dict.get("usage", {})
+@@ -734,46 +864,37 @@
+                     "input": arguments
+                 })
+         elif tool_calls and not is_claude_model:
+-            # For non-Claude models, convert tool calls to text format
+-            logger.debug(f"Converting tool calls to text for non-Claude model: {clean_model}")
+-            
+-            # We'll append tool info to the text content
+-            tool_text = "\n\nTool usage:\n"
+-            
+-            # Convert to list if it's not already
++            # For non-Claude models, convert tool calls to Anthropic tool_use format
++            # (same as Claude models — free-code expects tool_use blocks regardless of backend)
++            logger.debug(f"Converting tool calls to tool_use for non-Claude model: {clean_model}")
++
+             if not isinstance(tool_calls, list):
+                 tool_calls = [tool_calls]
+-                
++
+             for idx, tool_call in enumerate(tool_calls):
+-                # Extract function data based on whether it's a dict or object
++                # Always generate Anthropic-style toolu_ IDs — free-code requires this format
++                tool_id = f"toolu_{uuid.uuid4().hex[:24]}"
+                 if isinstance(tool_call, dict):
+                     function = tool_call.get("function", {})
+-                    tool_id = tool_call.get("id", f"tool_{uuid.uuid4()}")
+                     name = function.get("name", "")
+                     arguments = function.get("arguments", "{}")
+                 else:
+                     function = getattr(tool_call, "function", None)
+-                    tool_id = getattr(tool_call, "id", f"tool_{uuid.uuid4()}")
+                     name = getattr(function, "name", "") if function else ""
+                     arguments = getattr(function, "arguments", "{}") if function else "{}"
+-                
+-                # Convert string arguments to dict if needed
++
+                 if isinstance(arguments, str):
+                     try:
+-                        args_dict = json.loads(arguments)
+-                        arguments_str = json.dumps(args_dict, indent=2)
++                        arguments = json.loads(arguments)
+                     except json.JSONDecodeError:
+-                        arguments_str = arguments
+-                else:
+-                    arguments_str = json.dumps(arguments, indent=2)
+-                
+-                tool_text += f"Tool: {name}\nArguments: {arguments_str}\n\n"
+-            
+-            # Add or append tool text to content
+-            if content and content[0]["type"] == "text":
+-                content[0]["text"] += tool_text
+-            else:
+-                content.append({"type": "text", "text": tool_text})
++                        arguments = {"raw": arguments}
++
++                content.append({
++                    "type": "tool_use",
++                    "id": tool_id,
++                    "name": name,
++                    "input": arguments
++                })
+         
+         # Get usage information - extract values safely from object or dict
+         if isinstance(usage_info, dict):
+@@ -901,12 +1022,26 @@
+                     
+                     # Process text content
+                     delta_content = None
+-                    
++
+                     # Handle different formats of delta content
+                     if hasattr(delta, 'content'):
+                         delta_content = delta.content
+                     elif isinstance(delta, dict) and 'content' in delta:
+                         delta_content = delta['content']
++
++                    # Handle Qwen's reasoning/thinking field in streaming
++                    # If content is empty, check for reasoning tokens
++                    if delta_content is None or delta_content == "":
++                        reasoning_delta = None
++                        if hasattr(delta, 'reasoning'):
++                            reasoning_delta = delta.reasoning
++                        elif hasattr(delta, 'reasoning_content'):
++                            reasoning_delta = delta.reasoning_content
++                        elif isinstance(delta, dict):
++                            reasoning_delta = delta.get('reasoning', None) or delta.get('reasoning_content', None)
++
++                        if reasoning_delta:
++                            delta_content = reasoning_delta
+                     
+                     # Accumulate text content
+                     if delta_content is not None and delta_content != "":
+@@ -970,14 +1105,14 @@
+                                 anthropic_tool_index = last_tool_index
+                                 
+                                 # Extract function info
++                                # Always generate Anthropic-style toolu_ IDs for streaming too
++                                tool_id = f"toolu_{uuid.uuid4().hex[:24]}"
+                                 if isinstance(tool_call, dict):
+                                     function = tool_call.get('function', {})
+                                     name = function.get('name', '') if isinstance(function, dict) else ""
+-                                    tool_id = tool_call.get('id', f"toolu_{uuid.uuid4().hex[:24]}")
+                                 else:
+                                     function = getattr(tool_call, 'function', None)
+                                     name = getattr(function, 'name', '') if function else ''
+-                                    tool_id = getattr(tool_call, 'id', f"toolu_{uuid.uuid4().hex[:24]}")
+                                 
+                                 # Start a new tool_use block
+                                 yield f"event: content_block_start\ndata: {json.dumps({'type': 'content_block_start', 'index': anthropic_tool_index, 'content_block': {'type': 'tool_use', 'id': tool_id, 'name': name, 'input': {}}})}\n\n"
+@@ -1118,7 +1253,11 @@
+             clean_model = clean_model[len("openai/"):]
+         
+         logger.debug(f"📊 PROCESSING REQUEST: Model={request.model}, Stream={request.stream}")
+-        
++
++        # Two-stage VL→Coder: if messages contain images, describe them first via VL model
++        if VISION_MODEL_BASE:
++            request.messages = await replace_images_with_descriptions(request.messages)
++
+         # Convert Anthropic request to LiteLLM format
+         litellm_request = convert_anthropic_to_litellm(request)
+         
